@@ -1,3 +1,8 @@
+# Project 5 for CS3700, March 2023
+## Description 
+This project was intended to provide experience with HTTP and HTML. We were given a fake social media site (Fakebook), and had to crawl through its pages in order to collect all 10 secret flags. This involved logging into the website using cookies and tokens, then parsing the HTML and finding hyperlinks to continue crawling. 
+
+## Approach
 Our program first logs in to Fakebook, then crawls through the pages until it finds 5 flags. 
 
 In order to log in, we first GET the login page, and start building a POST request. We created an HTML parser in order
