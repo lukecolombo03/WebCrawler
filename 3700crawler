@@ -1,0 +1,184 @@
+#!/usr/bin/env python3
+
+import argparse, socket, urllib.parse, html, html.parser, xml, ssl
+from html.parser import HTMLParser
+
+# NOT ALLOWED: urllib, urllib2, httplib, requests, pycurl, and cookielib.
+
+DEFAULT_SERVER = "proj5.3700.network"
+DEFAULT_PORT = 443
+FLAGS = []
+# all three of these are lists of URLs. TO_VISIT = our queue of where to visit, VISITED = already visited,
+# NO_VISIT = we got a 403 or 404 from that page, so we're abandoning it
+TO_VISIT = []
+VISITED = []
+NO_VISIT = []
+
+TOKEN = None
+CONTEXT = ssl.create_default_context()
+
+
+# TODO:
+#  5) make sure flag checking works
+#  6) implement keep-alive or parallelism?
+#  7) if we get 403 or 404, abandon that URL
+#  8) if we get 503, retry that URL until it works
+
+# Parses HTML, which comes from the body of an HTTP response. It gets the middlewaretoken, and also adds new pages to
+# TO_VISIT iff we haven't visited them before and they're not already in TO_VISIT. Also prints out the secret flags
+class MyHTMLParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.flag = False
+
+    def handle_starttag(self, tag, attrs):
+        for i in range(0, len(attrs)):
+            if attrs[i][1] == "csrfmiddlewaretoken":
+                global TOKEN
+                TOKEN = attrs[i + 1][1]
+                break
+        for name, value in attrs:
+            if name == 'href' and '/fakebook/' in value and value not in VISITED and value not in TO_VISIT and value \
+                    not in NO_VISIT:
+                TO_VISIT.append(value)
+                VISITED.append(value)
+            if tag == 'h2' and value == 'secret_flag':
+                self.flag = True
+
+    def handle_data(self, data):
+        if self.flag:
+            FLAGS.append(data)
+            self.flag = False
+            print(data[6:])  # only print the value, not the "FLAG:" part
+
+
+class Crawler:
+    def __init__(self, args):
+        global SERVER
+        global PORT
+        SERVER = args.server
+        PORT = args.port
+        self.session_id = ''
+        self.csrf = ''
+        self.username = args.username
+        self.password = args.password
+        self.url_start = "https://%s:%s" % (SERVER, PORT)
+        self.host_header = "Host: %s" % SERVER + "\r\n"
+
+    # takes in data to send, sends it, and returns the response
+    def new_socket_send_recv(self, data, url=""):
+        my_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        my_socket = CONTEXT.wrap_socket(my_socket, server_hostname=SERVER)
+        my_socket.connect((SERVER, PORT))
+        # print("Request to %s:%d" % (SERVER, PORT))
+        # print(data)
+        my_socket.send(data.encode('ascii'))
+        received = ""
+        while True:
+            data = my_socket.recv(1024).decode('ascii')
+            received += data
+            if not data:
+                break
+        # print("Reponse\r\n%s\r\n" % received)
+        my_socket.close()
+        dic = self.parse_http_response(received)
+        status_code = list(dic.keys())[0][9:12]
+        if status_code == "302":  # if it's a redirect
+            if dic['Location'] not in TO_VISIT:
+                TO_VISIT.append(dic['Location'])
+        if status_code == "403" or status_code == "404":  # give up on that URL
+            # NO_VISIT.append(URL)
+            None
+        if status_code == "503":  # retry
+            # my_socket.close()
+            # self.new_socket_send_recv(data)
+            None
+        MyHTMLParser().feed(received)  # parse the response to find hyperlinks to add to TO_VISIT
+        return received
+
+    # takes an HTTP response and turns it into a dictionary
+    # the first line (response code) will have a value of None
+    def parse_http_response(self, string):
+        split = string.split("\r\n")
+        parsed_as_list = []
+        for line in split:
+            header_value_pair = line.split(": ")
+            parsed_as_list.append(header_value_pair)
+        returned_dict = {}
+        for x in parsed_as_list:
+            if len(x) == 1:
+                returned_dict[x[0]] = None
+            else:  # the headers for token and sessionid are both called Set-Cookie, so we need to differentiate them
+                if x[1][0:2] == 'cs':
+                    returned_dict['csrftoken'] = x[1].split(";")[0] + ";"
+                    self.csrf = returned_dict['csrftoken']
+                if x[1][0:2] == 'se':
+                    returned_dict['sessionid'] = x[1].split(";")[0] + ";"
+                    self.session_id = returned_dict['sessionid']
+                else:
+                    returned_dict[x[0]] = x[1]
+        return returned_dict
+
+    def run(self):
+        self.login()
+        while len(TO_VISIT) > 0:
+            self.visit(TO_VISIT[0])
+            TO_VISIT.pop(0)
+            if len(FLAGS) == 5:
+                break
+
+    def login(self):
+        global PORT
+        global SERVER
+        received = self.new_socket_send_recv("GET %s/accounts/login/?next=/fakebook/ HTTP/1.0\r\n\r\n" %
+                                             self.url_start)
+        self.parse_http_response(received)  # set csrf and session_id
+        my_parser = MyHTMLParser()
+        my_parser.feed(received)  # parse the response body in order to get the middleware token
+        request_method = "POST %s/accounts/login/?next=/fakebook/ HTTP/1.1\r\n" % self.url_start
+        content_type = "Content-Type: application/x-www-form-urlencoded\r\n"
+        cookie = "Cookie: %s %s" % (self.csrf, self.session_id) + "\r\n"
+        body = "csrfmiddlewaretoken=%s&username=%s&password=%s&next=" % (TOKEN, self.username, self.password) + "\r\n"
+        content_len = "Content-Length: " + str(len(body)) + "\r\n"
+        connection_type = "Connection: keep-alive\r\n"
+        login_request = request_method + cookie + content_type + self.host_header + content_len + connection_type \
+                        + "\r\n" + body
+        received = self.new_socket_send_recv(login_request)  # reset session id once after logging in
+
+        cookie = "Cookie: %s %s" % (self.csrf, self.session_id) + "\r\n"
+        request_method = "GET / HTTP/1.1\r\n"
+        third_request = request_method + cookie + content_type + self.host_header + content_len + connection_type + \
+                        "\r\n"
+        VISITED.append("/")
+        self.new_socket_send_recv(third_request)
+
+        request_method = "GET /fakebook/ HTTP/1.1\r\n"
+        fourth_request = request_method + cookie + content_type + self.host_header + content_len + connection_type \
+                         + "\r\n"
+        VISITED.append("/fakebook/")
+        # gets the homepage with the profiles on it, appends those to TO_VISIT, and begins the crawl
+        self.new_socket_send_recv(fourth_request)
+
+    # construct a new GET request around the given URL
+    def visit(self, URL):
+        body = "csrfmiddlewaretoken=%s&username=%s&password=%s&next=" % (TOKEN, self.username, self.password) + "\r\n"
+        content_len = "Content-Length: " + str(len(body)) + "\r\n"
+        cookie = "Cookie: %s %s" % (self.csrf, self.session_id) + "\r\n"
+        content_type = "Content-Type: application/x-www-form-urlencoded\r\n"
+        connection_type = "Connection: keep-alive\r\n"
+
+        request_method = "GET %s HTTP/1.1\r\n" % URL
+        request = request_method + cookie + content_type + self.host_header + content_len + connection_type + "\r\n"
+        VISITED.append(URL)
+        self.new_socket_send_recv(request)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='crawl Fakebook')
+    parser.add_argument('-s', dest="server", type=str, default=DEFAULT_SERVER, help="The server to crawl")
+    parser.add_argument('-p', dest="port", type=int, default=DEFAULT_PORT, help="The port to use")
+    parser.add_argument('username', type=str, help="The username to use")
+    parser.add_argument('password', type=str, help="The password to use")
+    args = parser.parse_args()
+    sender = Crawler(args)
+    sender.run()
